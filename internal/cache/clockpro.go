@@ -490,6 +490,9 @@ func (c *shard) validateOrder() bool {
 func (c *shard) validateOverlapped() bool {
 	if c.handHot == c.handCold && c.handCold == c.handTest {
 		if c.sizeCold > 0 && c.sizeTest > 0 && c.sizeHot > 0 {
+			if c.handHot.ptype == etCold && c.sizeCold == c.handHot.size {
+				return true
+			}
 			return false
 		}
 	}
@@ -504,9 +507,10 @@ func (c *shard) evict() {
 		}
 		c.runHandCold()
 		for c.targetSize()-c.coldTarget <= c.sizeHot && c.handHot != nil {
-			c.runHandHot()
-			if c.handHot == c.handCold && c.handCold != nil {
-				break
+			if c.handHot == c.handCold && c.handHot == c.handTest && c.sizeCold > 0 {
+				c.runHandCold()
+			} else {
+				c.runHandHot()
 			}
 		}
 	}
