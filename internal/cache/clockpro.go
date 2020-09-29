@@ -503,6 +503,12 @@ func (c *shard) evict() {
 			c.runHandHot()
 		}
 		c.runHandCold()
+		for c.targetSize()-c.coldTarget <= c.sizeHot && c.handHot != nil {
+			c.runHandHot()
+			if c.handHot == c.handCold && c.handCold != nil {
+				break
+			}
+		}
 	}
 	if !c.validateOverlapped() {
 		log.Println(before)
@@ -548,12 +554,7 @@ func (c *shard) runHandCold() {
 			}
 		}
 	}
-
 	c.handCold = c.handCold.next()
-
-	for c.targetSize()-c.coldTarget <= c.sizeHot && c.handHot != nil {
-		c.runHandHot()
-	}
 }
 
 func (c *shard) runHandHot() {
@@ -579,13 +580,6 @@ func (c *shard) runHandHot() {
 }
 
 func (c *shard) runHandTest() {
-	if c.sizeCold > 0 && c.handTest == c.handCold && c.handCold != nil {
-		c.runHandCold()
-		if c.handTest == nil {
-			return
-		}
-	}
-
 	e := c.handTest
 	if e.ptype == etTest {
 		c.sizeTest -= e.size
