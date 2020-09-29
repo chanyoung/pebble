@@ -19,6 +19,7 @@ package cache // import "github.com/cockroachdb/pebble/internal/cache"
 
 import (
 	"fmt"
+	"log"
 	"os"
 	"runtime"
 	"runtime/debug"
@@ -397,9 +398,130 @@ func (c *shard) metaEvict(e *entry) {
 	e.free()
 }
 
+func (c *shard) dump() string {
+	s := fmt.Sprintf("maxSize: %d, reserved: %d, targetSize: %d, coldTarget: %d, targetCold: %d\n",
+		c.maxSize, c.reservedSize, c.targetSize(), c.coldTarget, c.coldTarget)
+	s = s + fmt.Sprintf("sizeHot: %d, sizeCold: %d, sizeTest: %d\n", c.sizeHot, c.sizeCold, c.sizeTest)
+	list := ""
+	if c.handHot != nil {
+		e := c.handHot
+		for cnt := 1; ; cnt++ {
+			list = list + c.str(e)
+
+			e = e.next()
+			if e == c.handHot {
+				break
+			}
+			if cnt%8 == 0 {
+				list = list + "\n"
+			}
+			list = list + "->"
+		}
+		list = list + "\n"
+	}
+	s = s + list
+	return s
+}
+
+func (c *shard) str(e *entry) string {
+	hand := "/"
+	if e == c.handHot {
+		hand += "**HOT**/"
+	}
+	if e == c.handCold {
+		hand += "**COLD**/"
+	}
+	if e == c.handTest {
+		hand += "**TEST**/"
+	}
+	return fmt.Sprintf("|%s%s/%s]", hand, e.ptype.String(), e.key.String())
+}
+
+func (c *shard) validateTestReuseDistance() bool {
+	if c.handCold == c.handTest {
+		return true
+	}
+	for e := c.handCold.next(); e != c.handTest; e = e.next() {
+		if e.ptype == etTest {
+			return false
+		}
+	}
+	return true
+}
+
+func (c *shard) validateColdReuseDistance() bool {
+	if c.handHot == c.handCold {
+		return true
+	}
+	for e := c.handHot.next(); e != c.handCold; e = e.next() {
+		if e.ptype == etCold {
+			return false
+		}
+	}
+	return true
+}
+
+func (c *shard) validateOrder() bool {
+	if c.handHot == c.handCold && c.handHot == c.handTest {
+		return true
+	}
+	if c.handHot == c.handCold && c.handHot != c.handTest {
+		return true
+	}
+	if c.handHot == c.handTest && c.handHot != c.handCold {
+		return true
+	}
+	test := false
+	for e := c.handHot.next(); e != c.handHot; e = e.next() {
+		if e == c.handTest {
+			test = true
+		}
+		if e == c.handCold {
+			if !test {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+func (c *shard) validateOverlapped() bool {
+	if c.handHot == c.handCold && c.handCold == c.handTest {
+		if c.sizeCold > 0 && c.sizeTest > 0 && c.sizeHot > 0 {
+			return false
+		}
+	}
+	return true
+}
+
 func (c *shard) evict() {
+	before := c.dump()
 	for c.targetSize() <= c.sizeHot+c.sizeCold && c.handCold != nil {
 		c.runHandCold()
+	}
+	if !c.validateOverlapped() {
+		log.Println(before)
+		log.Println(c.dump())
+		debug.PrintStack()
+		log.Fatalln("Hands all met but all entry types are exist")
+	}
+	if !c.validateOrder() {
+		log.Println(before)
+		log.Println(c.dump())
+		debug.PrintStack()
+		log.Fatalln("Hands order is not valid")
+	}
+	if !c.validateTestReuseDistance() {
+		log.Println(before)
+		log.Println(c.dump())
+		debug.PrintStack()
+		log.Fatalln("Test reuse distance is not valid")
+	}
+	if !c.validateColdReuseDistance() {
+		log.Println(before)
+		log.Println(c.dump())
+		debug.PrintStack()
+		log.Fatalln("Cold reuse distance is not valid")
 	}
 }
 
