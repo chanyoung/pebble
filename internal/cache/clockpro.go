@@ -301,7 +301,9 @@ func (c *shard) metaAdd(key key, e *entry) bool {
 	}
 
 	if c.handCold == c.handHot {
-		c.handCold = c.handCold.prev()
+		if !(c.handHot == c.handTest && c.sizeTest == 0) {
+			c.handCold = c.handCold.prev()
+		}
 	}
 
 	fkey := key.file()
@@ -497,6 +499,9 @@ func (c *shard) validateOverlapped() bool {
 func (c *shard) evict() {
 	before := c.dump()
 	for c.targetSize() <= c.sizeHot+c.sizeCold && c.handCold != nil {
+		if c.handCold == c.handHot && c.handHot != c.handTest {
+			c.runHandHot()
+		}
 		c.runHandCold()
 	}
 	if !c.validateOverlapped() {
