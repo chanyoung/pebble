@@ -332,13 +332,13 @@ func (c *shard) metaDel(e *entry) {
 	}
 
 	if e == c.handHot {
-		c.handHot = c.handHot.prev()
+		c.handHot = c.handHot.next()
 	}
 	if e == c.handCold {
-		c.handCold = c.handCold.prev()
+		c.handCold = c.handCold.next()
 	}
 	if e == c.handTest {
-		c.handTest = c.handTest.prev()
+		c.handTest = c.handTest.next()
 	}
 
 	if e.unlink() == e {
@@ -562,13 +562,6 @@ func (c *shard) runHandCold() {
 }
 
 func (c *shard) runHandHot() {
-	if c.handHot == c.handTest && c.handTest != nil {
-		c.runHandTest()
-		if c.handHot == nil {
-			return
-		}
-	}
-
 	e := c.handHot
 	if e.ptype == etHot {
 		if atomic.LoadInt32(&e.referenced) == 1 {
@@ -581,6 +574,10 @@ func (c *shard) runHandHot() {
 	}
 
 	c.handHot = c.handHot.next()
+
+	if c.handHot.prev() == c.handTest {
+		c.runHandTest()
+	}
 }
 
 func (c *shard) runHandTest() {
@@ -594,9 +591,9 @@ func (c *shard) runHandTest() {
 		c.metaDel(e)
 		c.metaCheck(e)
 		e.free()
+	} else {
+		c.handTest = c.handTest.next()
 	}
-
-	c.handTest = c.handTest.next()
 }
 
 // Metrics holds metrics for the cache.
