@@ -243,6 +243,16 @@ func (c *shard) Free() {
 		c.metaDel(c.handHot)
 		e.free()
 	}
+	for c.handCold != nil {
+		e := c.handCold
+		c.metaDel(c.handCold)
+		e.free()
+	}
+	for c.handTest != nil {
+		e := c.handTest
+		c.metaDel(c.handTest)
+		e.free()
+	}
 
 	c.blocks.free()
 	c.files.free()
@@ -385,6 +395,20 @@ func (c *shard) metaCheck(e *entry) {
 				os.Exit(1)
 			}
 		}
+		for t := c.handCold.next(); t != c.handCold; t = t.next() {
+			if e == t {
+				fmt.Fprintf(os.Stderr, "%p: %s unexpectedly found in blocks list\n%s",
+					e, e.key, debug.Stack())
+				os.Exit(1)
+			}
+		}
+		for t := c.handTest.next(); t != c.handTest; t = t.next() {
+			if e == t {
+				fmt.Fprintf(os.Stderr, "%p: %s unexpectedly found in blocks list\n%s",
+					e, e.key, debug.Stack())
+				os.Exit(1)
+			}
+		}
 	}
 }
 
@@ -515,16 +539,15 @@ func (c *shard) evict() {
 		}
 	*/
 	for c.targetSize() <= c.sizeHot+c.sizeCold {
-		if c.coldTarget < c.sizeCold {
+		if c.coldTarget < c.sizeCold || c.sizeHot == 0 {
 			c.runHandCold()
 		} else {
-			if c.sizeHot == 0 {
-				c.runHandCold()
-			} else {
-				c.runHandHot()
-			}
+			c.runHandHot()
 		}
 	}
+	// fmt.Printf("maxSize: %d, reserved: %d, targetSize: %d, coldTarget: %d, targetCold: %d\n",
+	// 	c.maxSize, c.reservedSize, c.targetSize(), c.coldTarget, c.coldTarget)
+	// fmt.Printf("sizeHot: %d, sizeCold: %d, sizeTest: %d\n", c.sizeHot, c.sizeCold, c.sizeTest)
 	// if !c.validateOverlapped() {
 	// 	log.Println(before)
 	// 	log.Println(c.dump())
@@ -553,7 +576,12 @@ func (c *shard) evict() {
 
 func (c *shard) runHandCold() {
 	e := c.handCold
-	c.handCold = c.handCold.next()
+	if c.handCold.next() == c.handCold {
+		c.handCold = nil
+	} else {
+		c.handCold = c.handCold.next()
+	}
+
 	if atomic.LoadInt32(&e.referenced) == 1 {
 		atomic.StoreInt32(&e.referenced, 0)
 		e.ptype = etHot
@@ -576,7 +604,7 @@ func (c *shard) runHandCold() {
 		} else {
 			c.handTest.link(e)
 		}
-		for c.targetSize() < c.sizeTest && c.handTest != nil {
+		for c.targetSize() < c.sizeTest {
 			c.runHandTest()
 		}
 	}
@@ -584,13 +612,19 @@ func (c *shard) runHandCold() {
 
 func (c *shard) runHandHot() {
 	e := c.handHot
-	c.handHot = c.handHot.next()
 	if atomic.LoadInt32(&e.referenced) == 1 {
 		atomic.StoreInt32(&e.referenced, 0)
+		c.handHot = c.handHot.next()
 	} else {
 		e.ptype = etCold
 		c.sizeHot -= e.size
 		c.sizeCold += e.size
+		if c.handHot.next() == c.handHot {
+			c.handHot = nil
+		} else {
+			c.handHot = c.handHot.next()
+		}
+
 		e.unlink()
 		if c.handCold == nil {
 			c.handCold = e
