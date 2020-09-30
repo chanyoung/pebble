@@ -539,7 +539,7 @@ func (c *shard) evict() {
 		}
 	*/
 	for c.targetSize() <= c.sizeHot+c.sizeCold {
-		if c.coldTarget < c.sizeCold || c.sizeHot == 0 {
+		if c.sizeCold != 0 {
 			c.runHandCold()
 		} else {
 			c.runHandHot()
@@ -592,6 +592,9 @@ func (c *shard) runHandCold() {
 			c.handHot = e
 		} else {
 			c.handHot.link(e)
+		}
+		for c.targetSize()-c.coldTarget <= c.sizeHot && c.handHot != nil {
+			c.runHandHot()
 		}
 	} else {
 		e.setValue(nil)
