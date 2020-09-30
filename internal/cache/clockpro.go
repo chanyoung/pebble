@@ -19,7 +19,6 @@ package cache // import "github.com/cockroachdb/pebble/internal/cache"
 
 import (
 	"fmt"
-	"log"
 	"os"
 	"runtime"
 	"runtime/debug"
@@ -291,19 +290,20 @@ func (c *shard) metaAdd(key key, e *entry) bool {
 		c.entries[e] = struct{}{}
 	}
 
-	if c.handHot == nil {
-		// first element
-		c.handHot = e
-		c.handCold = e
-		c.handTest = e
-	} else {
-		c.handHot.link(e)
-	}
-
-	if c.handCold == c.handHot {
-		if !(c.handHot == c.handTest && c.sizeTest == 0) {
-			c.handCold = c.handCold.prev()
+	if e.ptype == etCold {
+		if c.handCold == nil {
+			c.handCold = e
+		} else {
+			c.handCold.link(e)
 		}
+	} else if e.ptype == etHot {
+		if c.handHot == nil {
+			c.handHot = e
+		} else {
+			c.handHot.link(e)
+		}
+	} else {
+		panic("pebble: meta add test type cache entry is invalid")
 	}
 
 	fkey := key.file()
@@ -340,12 +340,14 @@ func (c *shard) metaDel(e *entry) {
 	if e == c.handTest {
 		c.handTest = c.handTest.next()
 	}
-
 	if e.unlink() == e {
-		// This was the last entry in the cache.
-		c.handHot = nil
-		c.handCold = nil
-		c.handTest = nil
+		if e == c.handHot {
+			c.handHot = nil
+		} else if e == c.handCold {
+			c.handCold = nil
+		} else if e == c.handTest {
+			c.handTest = nil
+		}
 	}
 
 	fkey := e.key.file()
@@ -500,111 +502,114 @@ func (c *shard) validateOverlapped() bool {
 }
 
 func (c *shard) evict() {
-	before := c.dump()
-	for c.targetSize() <= c.sizeHot+c.sizeCold && c.handCold != nil {
-		if c.handCold == c.handHot && c.handHot != c.handTest {
-			c.runHandHot()
+	// before := c.dump()
+	/*
+		for c.targetSize() <= c.sizeHot+c.sizeCold && c.handCold != nil {
+			if c.handCold == c.handHot && c.handHot != c.handTest {
+				c.runHandHot()
+			}
+			c.runHandCold()
+			for c.targetSize()-c.coldTarget <= c.sizeHot && c.handHot != nil {
+				c.runHandHot()
+			}
 		}
-		c.runHandCold()
-		for c.targetSize()-c.coldTarget <= c.sizeHot && c.handHot != nil {
-			if c.handHot == c.handCold && c.handHot == c.handTest && c.sizeCold > 0 {
+	*/
+	for c.targetSize() <= c.sizeHot+c.sizeCold {
+		if c.coldTarget < c.sizeCold {
+			c.runHandCold()
+		} else {
+			if c.sizeHot == 0 {
 				c.runHandCold()
 			} else {
 				c.runHandHot()
 			}
 		}
 	}
-	if !c.validateOverlapped() {
-		log.Println(before)
-		log.Println(c.dump())
-		debug.PrintStack()
-		log.Fatalln("Hands all met but all entry types are exist")
-	}
-	if !c.validateOrder() {
-		log.Println(before)
-		log.Println(c.dump())
-		debug.PrintStack()
-		log.Fatalln("Hands order is not valid")
-	}
-	if !c.validateTestReuseDistance() {
-		log.Println(before)
-		log.Println(c.dump())
-		debug.PrintStack()
-		log.Fatalln("Test reuse distance is not valid")
-	}
-	if !c.validateColdReuseDistance() {
-		log.Println(before)
-		log.Println(c.dump())
-		debug.PrintStack()
-		log.Fatalln("Cold reuse distance is not valid")
-	}
+	// if !c.validateOverlapped() {
+	// 	log.Println(before)
+	// 	log.Println(c.dump())
+	// 	debug.PrintStack()
+	// 	log.Fatalln("Hands all met but all entry types are exist")
+	// }
+	// if !c.validateOrder() {
+	// 	log.Println(before)
+	// 	log.Println(c.dump())
+	// 	debug.PrintStack()
+	// 	log.Fatalln("Hands order is not valid")
+	// }
+	// if !c.validateTestReuseDistance() {
+	// 	log.Println(before)
+	// 	log.Println(c.dump())
+	// 	debug.PrintStack()
+	// 	log.Fatalln("Test reuse distance is not valid")
+	// }
+	// if !c.validateColdReuseDistance() {
+	// 	log.Println(before)
+	// 	log.Println(c.dump())
+	// 	debug.PrintStack()
+	// 	log.Fatalln("Cold reuse distance is not valid")
+	// }
 }
 
 func (c *shard) runHandCold() {
 	e := c.handCold
-	if e.ptype == etCold {
-		if atomic.LoadInt32(&e.referenced) == 1 {
-			atomic.StoreInt32(&e.referenced, 0)
-			e.ptype = etHot
-			c.sizeCold -= e.size
-			c.sizeHot += e.size
-			c.handCold = c.handCold.next()
-			if c.handHot == e {
-				c.handHot = c.handHot.next()
-			}
-			if c.handTest == e {
-				c.handTest = c.handTest.next()
-			}
-			e.unlink()
-			c.handHot.link(e)
+	c.handCold = c.handCold.next()
+	if atomic.LoadInt32(&e.referenced) == 1 {
+		atomic.StoreInt32(&e.referenced, 0)
+		e.ptype = etHot
+		c.sizeCold -= e.size
+		c.sizeHot += e.size
+		e.unlink()
+		if c.handHot == nil {
+			c.handHot = e
 		} else {
-			e.setValue(nil)
-			e.ptype = etTest
-			c.sizeCold -= e.size
-			c.sizeTest += e.size
-			for c.targetSize() < c.sizeTest && c.handTest != nil {
-				c.runHandTest()
-			}
-			c.handCold = c.handCold.next()
+			c.handHot.link(e)
 		}
 	} else {
-		c.handCold = c.handCold.next()
+		e.setValue(nil)
+		e.ptype = etTest
+		c.sizeCold -= e.size
+		c.sizeTest += e.size
+		e.unlink()
+		if c.handTest == nil {
+			c.handTest = e
+		} else {
+			c.handTest.link(e)
+		}
+		for c.targetSize() < c.sizeTest && c.handTest != nil {
+			c.runHandTest()
+		}
 	}
 }
 
 func (c *shard) runHandHot() {
 	e := c.handHot
-	if e.ptype == etHot {
-		if atomic.LoadInt32(&e.referenced) == 1 {
-			atomic.StoreInt32(&e.referenced, 0)
-		} else {
-			e.ptype = etCold
-			c.sizeHot -= e.size
-			c.sizeCold += e.size
-		}
-	}
-
 	c.handHot = c.handHot.next()
-
-	if c.handHot.prev() == c.handTest {
-		c.runHandTest()
+	if atomic.LoadInt32(&e.referenced) == 1 {
+		atomic.StoreInt32(&e.referenced, 0)
+	} else {
+		e.ptype = etCold
+		c.sizeHot -= e.size
+		c.sizeCold += e.size
+		e.unlink()
+		if c.handCold == nil {
+			c.handCold = e
+		} else {
+			c.handCold.link(e)
+		}
 	}
 }
 
 func (c *shard) runHandTest() {
 	e := c.handTest
-	if e.ptype == etTest {
-		c.sizeTest -= e.size
-		c.coldTarget -= e.size
-		if c.coldTarget < 0 {
-			c.coldTarget = 0
-		}
-		c.metaDel(e)
-		c.metaCheck(e)
-		e.free()
-	} else {
-		c.handTest = c.handTest.next()
+	c.sizeTest -= e.size
+	c.coldTarget -= e.size
+	if c.coldTarget < 0 {
+		c.coldTarget = 0
 	}
+	c.metaDel(e)
+	c.metaCheck(e)
+	e.free()
 }
 
 // Metrics holds metrics for the cache.
