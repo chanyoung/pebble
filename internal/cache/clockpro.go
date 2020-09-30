@@ -548,6 +548,15 @@ func (c *shard) runHandCold() {
 			e.ptype = etHot
 			c.sizeCold -= e.size
 			c.sizeHot += e.size
+			c.handCold = c.handCold.next()
+			if c.handHot == e {
+				c.handHot = c.handHot.next()
+			}
+			if c.handTest == e {
+				c.handTest = c.handTest.next()
+			}
+			e.unlink()
+			c.handHot.link(e)
 		} else {
 			e.setValue(nil)
 			e.ptype = etTest
@@ -556,9 +565,11 @@ func (c *shard) runHandCold() {
 			for c.targetSize() < c.sizeTest && c.handTest != nil {
 				c.runHandTest()
 			}
+			c.handCold = c.handCold.next()
 		}
+	} else {
+		c.handCold = c.handCold.next()
 	}
-	c.handCold = c.handCold.next()
 }
 
 func (c *shard) runHandHot() {
