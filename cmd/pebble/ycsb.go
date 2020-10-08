@@ -581,4 +581,5 @@ func (y *ycsb) done(elapsed time.Duration) {
 		float64(readAmpSum)/float64(readAmpCount),
 		total.WriteAmp(),
 	)
+	fmt.Printf("bcache hits: %d, misses: %d\n", m.BlockCache.Hits, m.BlockCache.Misses)
 }
