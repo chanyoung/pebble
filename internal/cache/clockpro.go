@@ -19,14 +19,12 @@ package cache // import "github.com/cockroachdb/pebble/internal/cache"
 
 import (
 	"fmt"
-	"log"
 	"os"
 	"runtime"
 	"runtime/debug"
 	"strings"
 	"sync"
 	"sync/atomic"
-	"time"
 
 	"github.com/cockroachdb/pebble/internal/base"
 	"github.com/cockroachdb/pebble/internal/invariants"
@@ -563,12 +561,12 @@ func newShards(size int64, shards int) *Cache {
 		shards:  make([]shard, shards),
 	}
 	c.trace("alloc", c.refs)
-	dump := fmt.Sprintf("dump-%d", time.Now().Unix())
-	f, err := os.OpenFile(dump, os.O_CREATE|os.O_WRONLY, 0644)
-	if err != nil {
-		log.Fatalf("failed creating file: %s", err)
-	}
-	c.Dump.f = f
+	// dump := fmt.Sprintf("dump-%d", time.Now().Unix())
+	// f, err := os.OpenFile(dump, os.O_CREATE|os.O_WRONLY, 0644)
+	// if err != nil {
+	// log.Fatalf("failed creating file: %s", err)
+	// }
+	// c.Dump.f = f
 	for i := range c.shards {
 		c.shards[i] = shard{
 			maxSize:    size / int64(len(c.shards)),
@@ -660,11 +658,12 @@ func (c *Cache) Unref() {
 // Get retrieves the cache value for the specified file and offset, returning
 // nil if no value is present.
 func (c *Cache) Get(id uint64, fileNum base.FileNum, offset uint64) Handle {
-	c.Dump.Lock()
-	defer c.Dump.Unlock()
-	ret := c.getShard(id, fileNum, offset).Get(id, fileNum, offset)
-	c.Dump.f.WriteString(fmt.Sprintf("Get: %d,%d,%d\n", id, fileNum, offset))
-	return ret
+	// c.Dump.Lock()
+	// defer c.Dump.Unlock()
+	// ret := c.getShard(id, fileNum, offset).Get(id, fileNum, offset)
+	// c.Dump.f.WriteString(fmt.Sprintf("Get %d %d %d\n", id, fileNum, offset))
+	// return ret
+	return c.getShard(id, fileNum, offset).Get(id, fileNum, offset)
 }
 
 // Set sets the cache value for the specified file and offset, overwriting an
@@ -672,32 +671,40 @@ func (c *Cache) Get(id uint64, fileNum base.FileNum, offset uint64) Handle {
 // retrieval of the cached value than Get (lock-free and avoidance of the map
 // lookup). The value must have been allocated by Cache.Alloc.
 func (c *Cache) Set(id uint64, fileNum base.FileNum, offset uint64, value *Value) Handle {
-	c.Dump.Lock()
-	defer c.Dump.Unlock()
-	ret := c.getShard(id, fileNum, offset).Set(id, fileNum, offset, value)
-	c.Dump.f.WriteString(fmt.Sprintf("Set: %d,%d,%d,%d\n", id, fileNum, offset, len(value.buf)))
-	return ret
+	// c.Dump.Lock()
+	// defer c.Dump.Unlock()
+	// ret := c.getShard(id, fileNum, offset).Set(id, fileNum, offset, value)
+	// c.Dump.f.WriteString(fmt.Sprintf("Set %d %d %d %p\n", id, fileNum, offset, value))
+	// return ret
+	return c.getShard(id, fileNum, offset).Set(id, fileNum, offset, value)
 }
 
 // Delete deletes the cached value for the specified file and offset.
 func (c *Cache) Delete(id uint64, fileNum base.FileNum, offset uint64) {
-	c.Dump.Lock()
-	defer c.Dump.Unlock()
+	// c.Dump.Lock()
+	// defer c.Dump.Unlock()
+	// c.getShard(id, fileNum, offset).Delete(id, fileNum, offset)
+	// c.Dump.f.WriteString(fmt.Sprintf("Delete %d %d %d\n", id, fileNum, offset))
 	c.getShard(id, fileNum, offset).Delete(id, fileNum, offset)
-	c.Dump.f.WriteString(fmt.Sprintf("Delete: %d,%d,%d\n", id, fileNum, offset))
 }
 
 // EvictFile evicts all of the cache values for the specified file.
 func (c *Cache) EvictFile(id uint64, fileNum base.FileNum) {
-	c.Dump.Lock()
-	defer c.Dump.Unlock()
+	// c.Dump.Lock()
+	// defer c.Dump.Unlock()
+	// if id == 0 {
+	// 	panic("pebble: 0 cache ID is invalid")
+	// }
+	// for i := range c.shards {
+	// 	c.shards[i].EvictFile(id, fileNum)
+	// }
+	// c.Dump.f.WriteString(fmt.Sprintf("EvictFile %d %d\n", id, fileNum))
 	if id == 0 {
 		panic("pebble: 0 cache ID is invalid")
 	}
 	for i := range c.shards {
 		c.shards[i].EvictFile(id, fileNum)
 	}
-	c.Dump.f.WriteString(fmt.Sprintf("EvictFile: %d,%d\n", id, fileNum))
 }
 
 // MaxSize returns the max size of the cache.
@@ -720,32 +727,57 @@ func (c *Cache) Size() int64 {
 // Cache.Set), or release the value (via Cache.Free). Failure to do so will
 // result in a memory leak.
 func (c *Cache) Alloc(n int) *Value {
-	c.Dump.Lock()
-	defer c.Dump.Unlock()
-	v := newValue(n)
-	c.Dump.f.WriteString(fmt.Sprintf("Alloc: %p, %d\n", v, n))
-	return v
+	// c.Dump.Lock()
+	// defer c.Dump.Unlock()
+	// v := newValue(n)
+	// c.Dump.f.WriteString(fmt.Sprintf("Alloc %p %d\n", v, n))
+	// return v
+	return newValue(n)
 }
 
 // Free frees the specified value. The buffer associated with the value will
 // possibly be reused, making it invalid to use the buffer after calling
 // Free. Do not call Free on a value that has been added to the cache.
 func (c *Cache) Free(v *Value) {
-	c.Dump.Lock()
-	defer c.Dump.Unlock()
+	// c.Dump.Lock()
+	// defer c.Dump.Unlock()
+	// if n := v.refs(); n > 1 {
+	// 	panic(fmt.Sprintf("pebble: Value has been added to the cache: refs=%d", n))
+	// }
+	// v.release()
+	// c.Dump.f.WriteString(fmt.Sprintf("Free %p\n", v))
 	if n := v.refs(); n > 1 {
 		panic(fmt.Sprintf("pebble: Value has been added to the cache: refs=%d", n))
 	}
 	v.release()
-	c.Dump.f.WriteString(fmt.Sprintf("Free: %p\n", v))
 }
 
 // Reserve N bytes in the cache. This effectively shrinks the size of the cache
 // by N bytes, without actually consuming any memory. The returned closure
 // should be invoked to release the reservation.
 func (c *Cache) Reserve(n int) func() {
-	c.Dump.Lock()
-	defer c.Dump.Unlock()
+	// c.Dump.Lock()
+	// defer c.Dump.Unlock()
+	// reserveID := time.Now().UnixNano()
+	// // Round-up the per-shard reservation. Most reservations should be large, so
+	// // this probably doesn't matter in practice.
+	// shardN := (n + len(c.shards) - 1) / len(c.shards)
+	// for i := range c.shards {
+	// 	c.shards[i].Reserve(shardN)
+	// }
+	// f := func() {
+	// 	c.Dump.f.WriteString(fmt.Sprintf("Unreserve %d\n", reserveID))
+	// 	if shardN == -1 {
+	// 		panic("pebble: cache reservation already released")
+	// 	}
+	// 	for i := range c.shards {
+	// 		c.shards[i].Reserve(-shardN)
+	// 	}
+	// 	shardN = -1
+	// }
+	// c.Dump.f.WriteString(fmt.Sprintf("Reserve %d %d\n", reserveID, n))
+	// return f
+
 	// Round-up the per-shard reservation. Most reservations should be large, so
 	// this probably doesn't matter in practice.
 	shardN := (n + len(c.shards) - 1) / len(c.shards)
@@ -761,8 +793,8 @@ func (c *Cache) Reserve(n int) func() {
 		}
 		shardN = -1
 	}
-	c.Dump.f.WriteString(fmt.Sprintf("Reserve: %d\n", n))
 	return f
+
 }
 
 // Metrics returns the metrics for the cache.

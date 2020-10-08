@@ -10,6 +10,7 @@ import (
 	"os"
 	"runtime"
 	"strconv"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -248,4 +249,117 @@ func BenchmarkCacheGet(b *testing.B) {
 			h.Release()
 		}
 	})
+}
+
+func TestCacheHitRatio(t *testing.T) {
+	// Test data was generated from the python code
+	f, err := os.Open("testdata/a64zipf")
+	require.NoError(t, err)
+
+	cache := newShards(536870912, 32)
+	defer cache.Unref()
+
+	scanner := bufio.NewScanner(f)
+
+	allocMap := make(map[string]*Value)
+	reserveMap := make(map[string]func())
+
+	prevHit := int64(0)
+	prevMiss := int64(0)
+	i := int64(0)
+	for scanner.Scan() {
+		fields := bytes.Fields(scanner.Bytes())
+
+		if strings.Compare("Get", string(fields[0])) == 0 {
+			id, err := strconv.ParseUint(string(fields[1]), 10, 64)
+			require.NoError(t, err)
+			fileNumUint, err := strconv.ParseUint(string(fields[2]), 10, 64)
+			require.NoError(t, err)
+			fileNum := base.FileNum(fileNumUint)
+			offset, err := strconv.ParseUint(string(fields[3]), 10, 64)
+			require.NoError(t, err)
+			h := cache.Get(id, fileNum, offset)
+			h.Release()
+			i++
+		} else if strings.Compare("Set", string(fields[0])) == 0 {
+			id, err := strconv.ParseUint(string(fields[1]), 10, 64)
+			require.NoError(t, err)
+			fileNumUint, err := strconv.ParseUint(string(fields[2]), 10, 64)
+			require.NoError(t, err)
+			fileNum := base.FileNum(fileNumUint)
+			offset, err := strconv.ParseUint(string(fields[3]), 10, 64)
+			require.NoError(t, err)
+			valueID := string(fields[4])
+
+			v, ok := allocMap[valueID]
+			if !ok {
+				t.Fatal("Try set with unallocated value")
+			}
+			h := cache.Set(id, fileNum, offset, v)
+			h.Release()
+		} else if strings.Compare("Delete", string(fields[0])) == 0 {
+			id, err := strconv.ParseUint(string(fields[1]), 10, 64)
+			require.NoError(t, err)
+			fileNumUint, err := strconv.ParseUint(string(fields[2]), 10, 64)
+			require.NoError(t, err)
+			fileNum := base.FileNum(fileNumUint)
+			offset, err := strconv.ParseUint(string(fields[3]), 10, 64)
+			require.NoError(t, err)
+			cache.Delete(id, fileNum, offset)
+		} else if strings.Compare("EvictFile", string(fields[0])) == 0 {
+			id, err := strconv.ParseUint(string(fields[1]), 10, 64)
+			require.NoError(t, err)
+			fileNumUint, err := strconv.ParseUint(string(fields[2]), 10, 64)
+			require.NoError(t, err)
+			fileNum := base.FileNum(fileNumUint)
+			cache.EvictFile(id, fileNum)
+		} else if strings.Compare("Alloc", string(fields[0])) == 0 {
+			valueID := string(fields[1])
+			n, err := strconv.Atoi(string(fields[2]))
+			require.NoError(t, err)
+			v := cache.Alloc(n)
+			allocMap[valueID] = v
+		} else if strings.Compare("Free", string(fields[0])) == 0 {
+			valueID := string(fields[1])
+			v, ok := allocMap[valueID]
+			if !ok {
+				t.Fatal("Try free with unallocated value")
+			}
+			delete(allocMap, valueID)
+			cache.Free(v)
+		} else if strings.Compare("Reserve", string(fields[0])) == 0 {
+			reserveID := string(fields[1])
+			n, err := strconv.Atoi(string(fields[2]))
+			require.NoError(t, err)
+			f := cache.Reserve(n)
+			reserveMap[reserveID] = f
+		} else if strings.Compare("Unreserve", string(fields[0])) == 0 {
+			reserveID := string(fields[1])
+			f, ok := reserveMap[reserveID]
+			if !ok {
+				t.Fatal("Try unreserve with invalid reserve id")
+			}
+			delete(reserveMap, reserveID)
+			f()
+		} else {
+			t.Fatalf("Unknown: %s\n", string(fields[0]))
+		}
+
+		if i%1000 == 0 {
+			m := cache.Metrics()
+			hit := m.Hits - prevHit
+			miss := m.Misses - prevMiss
+			sum := hit + miss
+			if sum != 0 {
+				t.Logf("Hits: %d Misses: %d ratio: %f\n", hit, miss, float64(hit)/float64(sum))
+				prevHit = m.Hits
+				prevMiss = m.Misses
+			}
+		}
+	}
+	m := cache.Metrics()
+	hit := m.Hits
+	miss := m.Misses
+	sum := hit + miss
+	t.Logf("[Total] Hits: %d Misses: %d ratio: %f\n", hit, miss, float64(hit)/float64(sum))
 }
