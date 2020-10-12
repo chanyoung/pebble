@@ -168,10 +168,7 @@ func (c *shard) Set(id uint64, fileNum base.FileNum, offset uint64, value *Value
 		c.metaDel(e)
 		c.metaCheck(e)
 
-		c.coldTarget += e.size
-		if c.coldTarget > c.targetSize() {
-			c.coldTarget = c.targetSize()
-		}
+		c.increaseColdTarget(e.size)
 
 		atomic.StoreInt32(&e.referenced, 0)
 		e.setValue(value)
@@ -299,10 +296,6 @@ func (c *shard) metaAdd(key key, e *entry) bool {
 		c.handHot.link(e)
 	}
 
-	if c.handCold == c.handHot {
-		c.handCold = c.handCold.prev()
-	}
-
 	fkey := key.file()
 	if fileBlocks := c.files.Get(fkey); fileBlocks == nil {
 		c.files.Put(fkey, e)
@@ -329,13 +322,13 @@ func (c *shard) metaDel(e *entry) {
 	}
 
 	if e == c.handHot {
-		c.handHot = c.handHot.prev()
+		c.handHot = c.handHot.next()
 	}
 	if e == c.handCold {
-		c.handCold = c.handCold.prev()
+		c.handCold = c.handCold.next()
 	}
 	if e == c.handTest {
-		c.handTest = c.handTest.prev()
+		c.handTest = c.handTest.next()
 	}
 
 	if e.unlink() == e {
@@ -398,46 +391,103 @@ func (c *shard) metaEvict(e *entry) {
 }
 
 func (c *shard) evict() {
-	for c.targetSize() <= c.sizeHot+c.sizeCold && c.handCold != nil {
-		c.runHandCold()
+	c.reclaim()
+	c.balanceHot()
+	c.balanceTest()
+}
+
+// Reclaim cache space by evicting cold entries. If the size of cold entries is
+// insufficient, then it continues with pushing handHot to demote hot entries
+// to cold entries.
+func (c *shard) reclaim() {
+	for c.targetSize() <= c.sizeHot+c.sizeCold {
+		if c.sizeCold > 0 {
+			c.runHandCold()
+		} else {
+			c.runHandHot()
+		}
+	}
+}
+
+// Balance test entries to not exceed the cache size, and balance hot/cold
+// ratio according to the parameter c.coldTarget.
+func (c *shard) balanceHot() {
+	// c.sizeHot > 0 is necessary to prevent infinite loop. cache.Reserve()
+	// shrinks c.targetSize() immediately but lazily shrinks c.coldTarget.
+	// This makes c.targetSize()-c.coldTarget can have negative values. It can
+	// cause infinite loop when the cache list is empty but balance is called.
+	for c.targetSize()-c.coldTarget < c.sizeHot && c.sizeHot > 0 {
+		c.runHandHot()
+	}
+}
+
+func (c *shard) balanceTest() {
+	for c.targetSize() < c.sizeTest {
+		c.runHandTest()
+	}
+}
+
+func (c *shard) moveEntry(src *entry, target *entry) {
+	if c.handHot == src {
+		c.handHot = c.handHot.next()
+	}
+	if c.handCold == src {
+		c.handCold = c.handCold.next()
+	}
+	if c.handTest == src {
+		c.handTest = c.handTest.next()
+	}
+	if src != target {
+		src.unlink()
+		target.link(src)
+	}
+}
+
+func (c *shard) increaseColdTarget(size int64) {
+	c.coldTarget += size
+	if c.coldTarget > c.targetSize() {
+		c.coldTarget = c.targetSize()
+	}
+}
+
+func (c *shard) decreaseColdTarget(size int64) {
+	c.coldTarget -= size
+	if c.coldTarget < 0 {
+		c.coldTarget = 0
 	}
 }
 
 func (c *shard) runHandCold() {
 	e := c.handCold
+	c.handCold = c.handCold.next()
 	if e.ptype == etCold {
 		if atomic.LoadInt32(&e.referenced) == 1 {
 			atomic.StoreInt32(&e.referenced, 0)
-			e.ptype = etHot
-			c.sizeCold -= e.size
-			c.sizeHot += e.size
+			if e.inTestPeriod {
+				e.inTestPeriod = false
+				c.increaseColdTarget(e.size)
+				e.ptype = etHot
+				c.sizeCold -= e.size
+				c.sizeHot += e.size
+			}
+			c.moveEntry(e, c.handHot)
 		} else {
-			e.setValue(nil)
-			e.ptype = etTest
-			c.sizeCold -= e.size
-			c.sizeTest += e.size
-			for c.targetSize() < c.sizeTest && c.handTest != nil {
-				c.runHandTest()
+			if e.inTestPeriod {
+				e.inTestPeriod = false
+				e.setValue(nil)
+				e.ptype = etTest
+				c.sizeCold -= e.size
+				c.sizeTest += e.size
+			} else {
+				c.metaEvict(e)
 			}
 		}
-	}
-
-	c.handCold = c.handCold.next()
-
-	for c.targetSize()-c.coldTarget <= c.sizeHot && c.handHot != nil {
-		c.runHandHot()
 	}
 }
 
 func (c *shard) runHandHot() {
-	if c.handHot == c.handTest && c.handTest != nil {
-		c.runHandTest()
-		if c.handHot == nil {
-			return
-		}
-	}
-
 	e := c.handHot
+	c.handHot = c.handHot.next()
 	if e.ptype == etHot {
 		if atomic.LoadInt32(&e.referenced) == 1 {
 			atomic.StoreInt32(&e.referenced, 0)
@@ -446,32 +496,26 @@ func (c *shard) runHandHot() {
 			c.sizeHot -= e.size
 			c.sizeCold += e.size
 		}
+	} else if e.ptype == etTest {
+		c.decreaseColdTarget(e.size)
+		c.metaEvict(e)
+	} else if e.ptype == etCold {
+		e.inTestPeriod = false
 	}
-
-	c.handHot = c.handHot.next()
+	if c.handHot.prev() == c.handTest {
+		c.handTest = c.handHot
+	}
 }
 
 func (c *shard) runHandTest() {
-	if c.sizeCold > 0 && c.handTest == c.handCold && c.handCold != nil {
-		c.runHandCold()
-		if c.handTest == nil {
-			return
-		}
-	}
-
 	e := c.handTest
-	if e.ptype == etTest {
-		c.sizeTest -= e.size
-		c.coldTarget -= e.size
-		if c.coldTarget < 0 {
-			c.coldTarget = 0
-		}
-		c.metaDel(e)
-		c.metaCheck(e)
-		e.free()
-	}
-
 	c.handTest = c.handTest.next()
+	if e.ptype == etTest {
+		c.decreaseColdTarget(e.size)
+		c.metaEvict(e)
+	} else if e.ptype == etCold {
+		e.inTestPeriod = false
+	}
 }
 
 // Metrics holds metrics for the cache.

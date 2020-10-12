@@ -57,7 +57,10 @@ type entry struct {
 	// referenced is atomically set to indicate that this entry has been accessed
 	// since the last time one of the clock hands swept it.
 	referenced int32
-	shard      *shard
+	// inTestPeriod indicates the entry is in its test period. This field is
+	// only used for cold type entries.
+	inTestPeriod bool
+	shard        *shard
 	// Reference count for the entry. The entry is freed when the reference count
 	// drops to zero.
 	ref refcnt
@@ -66,10 +69,11 @@ type entry struct {
 func newEntry(s *shard, key key, size int64) *entry {
 	e := entryAllocNew()
 	*e = entry{
-		key:   key,
-		size:  size,
-		ptype: etCold,
-		shard: s,
+		key:          key,
+		size:         size,
+		ptype:        etCold,
+		shard:        s,
+		inTestPeriod: true,
 	}
 	e.blockLink.next = e
 	e.blockLink.prev = e
