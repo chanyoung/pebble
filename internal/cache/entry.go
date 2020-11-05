@@ -7,21 +7,52 @@ package cache
 type entryType int8
 
 const (
-	etTest entryType = iota
-	etCold
+	// OutOfClock must be the first entry of iota because it uses to the determine the entry has been free.
+	etOutOfClock entryType = iota
 	etHot
+	etColdRes
+	etColdResInTest
+	etColdNonRes
 )
 
 func (p entryType) String() string {
 	switch p {
-	case etTest:
-		return "test"
-	case etCold:
-		return "cold"
 	case etHot:
 		return "hot"
+	case etColdRes:
+		return "coldRes"
+	case etColdResInTest:
+		return "coldResInTest"
+	case etColdNonRes:
+		return "coldNonRes"
+	case etOutOfClock:
+		return "outOfClock"
 	}
 	return "unknown"
+}
+
+func (p entryType) isInTest() bool {
+	return p == etColdResInTest || p == etColdNonRes
+}
+
+func (p entryType) isResident() bool {
+	return p.isResidentCold() || p == etHot
+}
+
+func (p entryType) isResidentCold() bool {
+	return p == etColdRes || p == etColdResInTest
+}
+
+func (p entryType) isCold() bool {
+	return p.isResidentCold() || p == etColdNonRes
+}
+
+func (p entryType) isHot() bool {
+	return p == etHot
+}
+
+func (p entryType) isInClock() bool {
+	return p != etOutOfClock
 }
 
 // entry holds the metadata for a cache entry. The memory for an entry is
@@ -68,7 +99,7 @@ func newEntry(s *shard, key key, size int64) *entry {
 	*e = entry{
 		key:   key,
 		size:  size,
-		ptype: etCold,
+		ptype: etOutOfClock,
 		shard: s,
 	}
 	e.blockLink.next = e
