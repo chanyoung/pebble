@@ -143,6 +143,7 @@ func (c *shard) Set(id uint64, fileNum base.FileNum, offset uint64, value *Value
 		if c.metaAdd(k, e) {
 			value.ref.trace("add-cold")
 			c.sizeCold += e.size
+			c.linkQueue(e, &c.handCold)
 		} else {
 			value.ref.trace("skip-cold")
 			e.free()
@@ -162,7 +163,6 @@ func (c *shard) Set(id uint64, fileNum base.FileNum, offset uint64, value *Value
 			value.ref.trace("add-cold")
 			c.sizeCold += delta
 		}
-		c.evict()
 
 	default:
 		// cache entry was a test page
@@ -182,12 +182,14 @@ func (c *shard) Set(id uint64, fileNum base.FileNum, offset uint64, value *Value
 		if c.metaAdd(k, e) {
 			value.ref.trace("add-hot")
 			c.sizeHot += e.size
+			c.linkQueue(e, &c.handHot)
 		} else {
 			value.ref.trace("skip-hot")
 			e.free()
 			e = nil
 		}
 	}
+	c.evict()
 
 	// Values are initialized with a reference count of 1. That reference count
 	// is being transferred to the returned Handle.
@@ -246,6 +248,16 @@ func (c *shard) Free() {
 		c.metaDel(c.handHot)
 		e.free()
 	}
+	for c.handCold != nil {
+		e := c.handCold
+		c.metaDel(c.handCold)
+		e.free()
+	}
+	for c.handTest != nil {
+		e := c.handTest
+		c.metaDel(c.handTest)
+		e.free()
+	}
 
 	c.blocks.free()
 	c.files.free()
@@ -264,6 +276,13 @@ func (c *shard) Size() int64 {
 	size := c.sizeHot + c.sizeCold
 	c.mu.RUnlock()
 	return size
+}
+
+func (c *shard) targetCold() int64 {
+	if c.coldTarget > c.targetSize() {
+		c.coldTarget = c.targetSize()
+	}
+	return c.coldTarget
 }
 
 func (c *shard) targetSize() int64 {
@@ -293,19 +312,6 @@ func (c *shard) metaAdd(key key, e *entry) bool {
 		c.entries[e] = struct{}{}
 	}
 
-	if c.handHot == nil {
-		// first element
-		c.handHot = e
-		c.handCold = e
-		c.handTest = e
-	} else {
-		c.handHot.link(e)
-	}
-
-	if c.handCold == c.handHot {
-		c.handCold = c.handCold.prev()
-	}
-
 	fkey := key.file()
 	if fileBlocks := c.files.Get(fkey); fileBlocks == nil {
 		c.files.Put(fkey, e)
@@ -313,6 +319,14 @@ func (c *shard) metaAdd(key key, e *entry) bool {
 		fileBlocks.linkFile(e)
 	}
 	return true
+}
+
+func (c *shard) linkQueue(e *entry, hand **entry) {
+	if *hand == nil {
+		*hand = e
+	} else {
+		(*hand).link(e)
+	}
 }
 
 // Remove the entry from the cache. This removes the entry from the blocks map,
@@ -332,20 +346,24 @@ func (c *shard) metaDel(e *entry) {
 	}
 
 	if e == c.handHot {
-		c.handHot = c.handHot.prev()
+		c.handHot = c.handHot.next()
 	}
 	if e == c.handCold {
-		c.handCold = c.handCold.prev()
+		c.handCold = c.handCold.next()
 	}
 	if e == c.handTest {
-		c.handTest = c.handTest.prev()
+		c.handTest = c.handTest.next()
 	}
 
 	if e.unlink() == e {
 		// This was the last entry in the cache.
-		c.handHot = nil
-		c.handCold = nil
-		c.handTest = nil
+		if e == c.handHot {
+			c.handHot = nil
+		} else if e == c.handCold {
+			c.handCold = nil
+		} else if e == c.handTest {
+			c.handTest = nil
+		}
 	}
 
 	fkey := e.key.file()
@@ -383,6 +401,20 @@ func (c *shard) metaCheck(e *entry) {
 				os.Exit(1)
 			}
 		}
+		for t := c.handCold.next(); t != c.handCold; t = t.next() {
+			if e == t {
+				fmt.Fprintf(os.Stderr, "%p: %s unexpectedly found in blocks list\n%s",
+					e, e.key, debug.Stack())
+				os.Exit(1)
+			}
+		}
+		for t := c.handTest.next(); t != c.handTest; t = t.next() {
+			if e == t {
+				fmt.Fprintf(os.Stderr, "%p: %s unexpectedly found in blocks list\n%s",
+					e, e.key, debug.Stack())
+				os.Exit(1)
+			}
+		}
 	}
 }
 
@@ -391,6 +423,8 @@ func (c *shard) metaEvict(e *entry) {
 	case etHot:
 		c.sizeHot -= e.size
 	case etColdInTest:
+		c.sizeCold -= e.size
+	case etCold:
 		c.sizeCold -= e.size
 	case etNonResident:
 		c.sizeTest -= e.size
@@ -401,82 +435,127 @@ func (c *shard) metaEvict(e *entry) {
 }
 
 func (c *shard) evict() {
-	for c.targetSize() <= c.sizeHot+c.sizeCold && c.handCold != nil {
-		c.runHandCold()
+	for c.targetSize() < c.sizeHot+c.sizeCold {
+		if c.targetCold() < c.sizeCold {
+			c.runHandCold()
+		} else {
+			c.runHandHot()
+		}
+	}
+	c.prune()
+}
+
+func (c *shard) prune() {
+	if c.handHot == nil {
+		return
+	}
+	for c.handTest != nil && c.handTest.age < c.handHot.age {
+		c.runHandTest()
 	}
 }
 
 func (c *shard) runHandCold() {
 	e := c.handCold
-	if e.ptype == etColdInTest {
-		if atomic.LoadInt32(&e.referenced) == 1 {
-			e.age = atomic.AddInt64(&c.virtualTime, 1)
-			atomic.StoreInt32(&e.referenced, 0)
+	c.handCold = c.handCold.next()
+
+	if atomic.LoadInt32(&e.referenced) == 1 {
+		e.age = atomic.AddInt64(&c.virtualTime, 1)
+		atomic.StoreInt32(&e.referenced, 0)
+		if e.ptype == etColdInTest {
 			e.ptype = etHot
 			c.sizeCold -= e.size
 			c.sizeHot += e.size
+			if e == e.unlink() {
+				c.handCold = nil
+			}
+			c.linkQueue(e, &c.handHot)
 		} else {
+			e.ptype = etColdInTest
+		}
+	} else {
+		if e.ptype == etColdInTest {
 			e.setValue(nil)
 			e.ptype = etNonResident
 			c.sizeCold -= e.size
 			c.sizeTest += e.size
-			for c.targetSize() < c.sizeTest && c.handTest != nil {
+			if e == e.unlink() {
+				c.handCold = nil
+			}
+			c.linkQueue(e, &c.handTest)
+			for c.targetSize() < c.sizeTest {
 				c.runHandTest()
 			}
+		} else {
+			c.metaEvict(e)
 		}
 	}
 
-	c.handCold = c.handCold.next()
+	// if e == c.handCold {
+	// 	c.handCold = nil
+	// }
+	// e.unlink()
 
-	for c.targetSize()-c.coldTarget <= c.sizeHot && c.handHot != nil {
-		c.runHandHot()
-	}
+	// if e.ptype == etColdInTest {
+	// 	if atomic.LoadInt32(&e.referenced) == 1 {
+	// 		e.age = atomic.AddInt64(&c.virtualTime, 1)
+	// 		atomic.StoreInt32(&e.referenced, 0)
+	// 		e.ptype = etHot
+	// 		c.sizeCold -= e.size
+	// 		c.sizeHot += e.size
+	// 		c.linkQueue(e, &c.handHot)
+	// 	} else {
+	// 		e.setValue(nil)
+	// 		e.ptype = etNonResident
+	// 		c.sizeCold -= e.size
+	// 		c.sizeTest += e.size
+	// 		c.linkQueue(e, &c.handTest)
+	// 		for c.targetSize() < c.sizeTest {
+	// 			c.runHandTest()
+	// 		}
+	// 	}
+	// } else if e.ptype == etCold {
+	// 	if atomic.LoadInt32(&e.referenced) == 1 {
+	// 		e.age = atomic.AddInt64(&c.virtualTime, 1)
+	// 		atomic.StoreInt32(&e.referenced, 0)
+	// 		e.ptype = etColdInTest
+	// 		c.linkQueue(e, &c.handCold)
+	// 	} else {
+	// 		c.metaEvict(e)
+	// 	}
+	// } else {
+	// 	panic(fmt.Sprintf("pebble: invalid entry type %s in cold queue", e.ptype.String()))
+	// }
 }
 
 func (c *shard) runHandHot() {
-	if c.handHot == c.handTest && c.handTest != nil {
-		c.runHandTest()
-		if c.handHot == nil {
-			return
-		}
-	}
-
 	e := c.handHot
-	if e.ptype == etHot {
-		if atomic.LoadInt32(&e.referenced) == 1 {
-			e.age = atomic.AddInt64(&c.virtualTime, 1)
-			atomic.StoreInt32(&e.referenced, 0)
-		} else {
-			e.ptype = etColdInTest
-			c.sizeHot -= e.size
-			c.sizeCold += e.size
-		}
-	}
-
 	c.handHot = c.handHot.next()
+	if atomic.LoadInt32(&e.referenced) == 1 {
+		e.age = atomic.AddInt64(&c.virtualTime, 0)
+		atomic.StoreInt32(&e.referenced, 0)
+	} else {
+		e.ptype = etCold
+		c.sizeHot -= e.size
+		c.sizeCold += e.size
+		if e == e.unlink() {
+			c.handHot = nil
+		}
+		c.linkQueue(e, &c.handCold)
+	}
 }
 
 func (c *shard) runHandTest() {
-	if c.sizeCold > 0 && c.handTest == c.handCold && c.handCold != nil {
-		c.runHandCold()
-		if c.handTest == nil {
-			return
-		}
-	}
+	c.adjustColdTarget(-c.handTest.size)
+	c.metaEvict(c.handTest)
+}
 
-	e := c.handTest
-	if e.ptype == etNonResident {
-		c.sizeTest -= e.size
-		c.coldTarget -= e.size
-		if c.coldTarget < 0 {
-			c.coldTarget = 0
-		}
-		c.metaDel(e)
-		c.metaCheck(e)
-		e.free()
+func (c *shard) adjustColdTarget(n int64) {
+	c.coldTarget += n
+	if c.coldTarget < 0 {
+		c.coldTarget = 0
+	} else if c.coldTarget > c.targetSize() {
+		c.coldTarget = c.targetSize()
 	}
-
-	c.handTest = c.handTest.next()
 }
 
 // Metrics holds metrics for the cache.

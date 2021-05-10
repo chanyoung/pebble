@@ -172,7 +172,7 @@ func TestReserve(t *testing.T) {
 	cache.Set(2, 0, 0, testValue(cache, "a", 1)).Release()
 	require.EqualValues(t, 2, cache.Size())
 	r := cache.Reserve(1)
-	require.EqualValues(t, 0, cache.Size())
+	require.EqualValues(t, 2, cache.Size())
 	cache.Set(1, 0, 0, testValue(cache, "a", 1)).Release()
 	cache.Set(2, 0, 0, testValue(cache, "a", 1)).Release()
 	cache.Set(3, 0, 0, testValue(cache, "a", 1)).Release()
@@ -180,8 +180,8 @@ func TestReserve(t *testing.T) {
 	require.EqualValues(t, 2, cache.Size())
 	r()
 	require.EqualValues(t, 2, cache.Size())
-	cache.Set(1, 0, 0, testValue(cache, "a", 1)).Release()
-	cache.Set(2, 0, 0, testValue(cache, "a", 1)).Release()
+	cache.Set(5, 0, 0, testValue(cache, "a", 1)).Release()
+	cache.Set(6, 0, 0, testValue(cache, "a", 1)).Release()
 	require.EqualValues(t, 4, cache.Size())
 }
 
