@@ -77,8 +77,9 @@ func (h Handle) Release() {
 }
 
 type shard struct {
-	hits   int64
-	misses int64
+	hits        int64
+	misses      int64
+	virtualTime int64
 
 	mu sync.RWMutex
 
@@ -137,6 +138,7 @@ func (c *shard) Set(id uint64, fileNum base.FileNum, offset uint64, value *Value
 	case e == nil:
 		// no cache entry? add it
 		e = newEntry(c, k, int64(len(value.buf)))
+		e.age = c.virtualTime
 		e.setValue(value)
 		if c.metaAdd(k, e) {
 			value.ref.trace("add-cold")
@@ -174,6 +176,7 @@ func (c *shard) Set(id uint64, fileNum base.FileNum, offset uint64, value *Value
 		}
 
 		atomic.StoreInt32(&e.referenced, 0)
+		e.age = c.virtualTime
 		e.setValue(value)
 		e.ptype = etHot
 		if c.metaAdd(k, e) {
@@ -407,6 +410,7 @@ func (c *shard) runHandCold() {
 	e := c.handCold
 	if e.ptype == etColdInTest {
 		if atomic.LoadInt32(&e.referenced) == 1 {
+			e.age = atomic.AddInt64(&c.virtualTime, 1)
 			atomic.StoreInt32(&e.referenced, 0)
 			e.ptype = etHot
 			c.sizeCold -= e.size
@@ -440,6 +444,7 @@ func (c *shard) runHandHot() {
 	e := c.handHot
 	if e.ptype == etHot {
 		if atomic.LoadInt32(&e.referenced) == 1 {
+			e.age = atomic.AddInt64(&c.virtualTime, 1)
 			atomic.StoreInt32(&e.referenced, 0)
 		} else {
 			e.ptype = etColdInTest

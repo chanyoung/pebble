@@ -64,6 +64,8 @@ type entry struct {
 	// Reference count for the entry. The entry is freed when the reference count
 	// drops to zero.
 	ref refcnt
+
+	age int64
 }
 
 func newEntry(s *shard, key key, size int64) *entry {
