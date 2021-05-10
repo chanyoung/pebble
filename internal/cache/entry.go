@@ -7,15 +7,18 @@ package cache
 type entryType int8
 
 const (
-	etTest entryType = iota
+	etNonResident entryType = iota
+	etColdInTest
 	etCold
 	etHot
 )
 
 func (p entryType) String() string {
 	switch p {
-	case etTest:
-		return "test"
+	case etNonResident:
+		return "non-resident"
+	case etColdInTest:
+		return "cold-in-test"
 	case etCold:
 		return "cold"
 	case etHot:
@@ -68,7 +71,7 @@ func newEntry(s *shard, key key, size int64) *entry {
 	*e = entry{
 		key:   key,
 		size:  size,
-		ptype: etCold,
+		ptype: etColdInTest,
 		shard: s,
 	}
 	e.blockLink.next = e

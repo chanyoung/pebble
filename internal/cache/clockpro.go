@@ -387,9 +387,9 @@ func (c *shard) metaEvict(e *entry) {
 	switch e.ptype {
 	case etHot:
 		c.sizeHot -= e.size
-	case etCold:
+	case etColdInTest:
 		c.sizeCold -= e.size
-	case etTest:
+	case etNonResident:
 		c.sizeTest -= e.size
 	}
 	c.metaDel(e)
@@ -405,7 +405,7 @@ func (c *shard) evict() {
 
 func (c *shard) runHandCold() {
 	e := c.handCold
-	if e.ptype == etCold {
+	if e.ptype == etColdInTest {
 		if atomic.LoadInt32(&e.referenced) == 1 {
 			atomic.StoreInt32(&e.referenced, 0)
 			e.ptype = etHot
@@ -413,7 +413,7 @@ func (c *shard) runHandCold() {
 			c.sizeHot += e.size
 		} else {
 			e.setValue(nil)
-			e.ptype = etTest
+			e.ptype = etNonResident
 			c.sizeCold -= e.size
 			c.sizeTest += e.size
 			for c.targetSize() < c.sizeTest && c.handTest != nil {
@@ -442,7 +442,7 @@ func (c *shard) runHandHot() {
 		if atomic.LoadInt32(&e.referenced) == 1 {
 			atomic.StoreInt32(&e.referenced, 0)
 		} else {
-			e.ptype = etCold
+			e.ptype = etColdInTest
 			c.sizeHot -= e.size
 			c.sizeCold += e.size
 		}
@@ -460,7 +460,7 @@ func (c *shard) runHandTest() {
 	}
 
 	e := c.handTest
-	if e.ptype == etTest {
+	if e.ptype == etNonResident {
 		c.sizeTest -= e.size
 		c.coldTarget -= e.size
 		if c.coldTarget < 0 {
