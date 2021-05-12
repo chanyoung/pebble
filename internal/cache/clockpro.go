@@ -98,10 +98,175 @@ type shard struct {
 	handHot  *entry
 	handCold *entry
 	handTest *entry
+	listHead *entry
 
-	sizeHot  int64
-	sizeCold int64
-	sizeTest int64
+	sizeHot        int64
+	sizeResCold    int64
+	sizeNonResCold int64
+}
+
+func (c *shard) printAll() {
+	if c.Size() == 0 {
+		return
+	}
+	s := c.print(c.listHead)
+	for e := c.listHead.prev(); e != c.listHead; e = e.prev() {
+		s += c.print(e)
+	}
+	fmt.Println(s)
+}
+
+func (c *shard) print(e *entry) string {
+	s := fmt.Sprintf("%s:%s:%d", e.key.String(), e.ptype.String(), e.referenced)
+	if e == c.handCold {
+		s += " <- handCold"
+	}
+	if e == c.handHot {
+		s += " <- handHot"
+	}
+	if e == c.handTest {
+		s += " <- handTest"
+	}
+	if e == c.listHead {
+		s += " <- listHead"
+	}
+	s += "\n"
+	return s
+}
+
+func (c *shard) adjustColdTarget(n int64) {
+	c.coldTarget += n
+	if c.coldTarget < 0 {
+		c.coldTarget = 0
+	} else if c.coldTarget > c.targetSize() {
+		c.coldTarget = c.targetSize()
+	}
+}
+
+func (c *shard) canPromote(candidate *entry) bool {
+	// To compare reuse distance, candidate must be in the clock. And only the node in its test
+	// period can be considered to promote.
+	if candidate.ptype == etOutOfClock || !candidate.ptype.isInTest() {
+		return false
+	}
+	// This candidate cold page is accessed during its test period, so we increment coldTarget by 1.
+	c.adjustColdTarget(+candidate.size)
+	for c.sizeHot >= c.targetSize()-c.coldTarget && c.sizeHot > 0 {
+		// handHot has passed the candidate and terminates its test period. Reject the promotion.
+		if !candidate.ptype.isInTest() {
+			return false
+		}
+		// Failed to demote a hot node. Reject the promotion.
+		if !c.runHandHot(candidate) {
+			return false
+		}
+	}
+	return true
+}
+
+func (c *shard) terminateTestPeriod(e *entry) {
+	if !e.ptype.isInTest() {
+		return
+	}
+	// We terminate the test period of the cold page, and also remove it from the clock if it is a
+	// non-resident page. Because the cold page has used up its test period without a re-access and
+	// has no chance to turn into a hot page with its next access.
+	if e.ptype == etColdResInTest {
+		e.ptype = etColdRes
+	} else {
+		c.metaEvict(e)
+	}
+	// If a cold page is accessed during its test period, we increment coldTarget by 1. If a cold
+	// page passes its test period without a re-access, we decrement coldTarget by 1. Note the
+	// aforementioned cold pages include resident and non-resident cold pages.
+	if atomic.LoadInt32(&e.referenced) == 1 {
+		c.adjustColdTarget(+e.size)
+	} else {
+		c.adjustColdTarget(-e.size)
+	}
+}
+
+func (c *shard) setEntryType(e *entry, ptype entryType) {
+	if e.ptype == etHot {
+		c.sizeHot -= e.size
+	}
+	if e.ptype.isResidentCold() {
+		c.sizeResCold -= e.size
+	}
+	if e.ptype == etColdNonRes {
+		c.sizeNonResCold -= e.size
+	}
+	e.ptype = ptype
+	if e.ptype == etHot {
+		c.sizeHot += e.size
+	}
+	if e.ptype.isResidentCold() {
+		c.sizeResCold += e.size
+	}
+	if e.ptype == etColdNonRes {
+		c.sizeNonResCold += e.size
+	}
+}
+
+func (c *shard) removeFromClock(e *entry) {
+	if e == c.listHead {
+		c.listHead = c.listHead.prev()
+	}
+	if e == c.handCold {
+		c.handCold = c.handCold.next()
+	}
+	if e == c.handHot {
+		c.handHot = c.handHot.next()
+	}
+	if e == c.handTest {
+		c.handTest = c.handTest.next()
+	}
+	if e == e.unlink() {
+		c.listHead = nil
+		c.handCold = nil
+		c.handHot = nil
+		c.handTest = nil
+	}
+	c.setEntryType(e, etOutOfClock)
+	atomic.StoreInt32(&e.referenced, 0)
+}
+
+func (c *shard) moveToHead(e *entry, ptype entryType) {
+	if e.ptype != etOutOfClock {
+		c.removeFromClock(e)
+	}
+	if c.listHead != nil {
+		c.listHead.link(e)
+	}
+	c.listHead = e
+	c.setEntryType(e, ptype)
+	if e.ptype.isResidentCold() && c.sizeResCold == e.size {
+		c.handCold = e
+	}
+	// } else if e.ptype == etHot && c.sizeHot == e.size {
+	// 	c.handHot = e
+	// } else if e.ptype == etColdNonRes && c.sizeNonResCold == e.size {
+	// 	c.handTest = e
+	// }
+}
+
+// Make handHot points to the hot page with the largest recency.
+func (c *shard) nextHandHot() {
+	if c.sizeHot > 0 {
+		if c.handHot == nil {
+			c.handHot = c.listHead.next()
+		}
+		for c.handHot.ptype != etHot {
+			if c.handHot == c.handTest {
+				c.handTest = c.handTest.next()
+			}
+			// Terminate test period of encountered cold pages.
+			c.handHot = c.handHot.next()
+			c.terminateTestPeriod(c.handHot.prev())
+		}
+	} else {
+		c.handHot = nil
+	}
 }
 
 func (c *shard) Get(id uint64, fileNum base.FileNum, offset uint64) Handle {
@@ -138,9 +303,8 @@ func (c *shard) Set(id uint64, fileNum base.FileNum, offset uint64, value *Value
 		// no cache entry? add it
 		e = newEntry(c, k, int64(len(value.buf)))
 		e.setValue(value)
-		if c.metaAdd(k, e) {
+		if c.metaAdd(k, e, etColdResInTest) {
 			value.ref.trace("add-cold")
-			c.sizeCold += e.size
 		} else {
 			value.ref.trace("skip-cold")
 			e.free()
@@ -152,19 +316,21 @@ func (c *shard) Set(id uint64, fileNum base.FileNum, offset uint64, value *Value
 		e.setValue(value)
 		atomic.StoreInt32(&e.referenced, 1)
 		delta := int64(len(value.buf)) - e.size
+		if delta > 0 {
+			c.evict(delta)
+		}
 		e.size = int64(len(value.buf))
 		if e.ptype == etHot {
 			value.ref.trace("add-hot")
 			c.sizeHot += delta
 		} else {
 			value.ref.trace("add-cold")
-			c.sizeCold += delta
+			c.sizeResCold += delta
 		}
-		c.evict()
 
 	default:
 		// cache entry was a test page
-		c.sizeTest -= e.size
+		c.sizeNonResCold -= e.size
 		c.metaDel(e)
 		c.metaCheck(e)
 
@@ -175,10 +341,8 @@ func (c *shard) Set(id uint64, fileNum base.FileNum, offset uint64, value *Value
 
 		atomic.StoreInt32(&e.referenced, 0)
 		e.setValue(value)
-		e.ptype = etHot
-		if c.metaAdd(k, e) {
+		if c.metaAdd(k, e, etHot) {
 			value.ref.trace("add-hot")
-			c.sizeHot += e.size
 		} else {
 			value.ref.trace("skip-hot")
 			e.free()
@@ -238,9 +402,9 @@ func (c *shard) Free() {
 
 	// NB: we use metaDel rather than metaEvict in order to avoid the expensive
 	// metaCheck call when the "invariants" build tag is specified.
-	for c.handHot != nil {
-		e := c.handHot
-		c.metaDel(c.handHot)
+	for c.listHead != nil {
+		e := c.listHead
+		c.metaDel(c.listHead)
 		e.free()
 	}
 
@@ -250,15 +414,15 @@ func (c *shard) Free() {
 
 func (c *shard) Reserve(n int) {
 	c.mu.Lock()
+	c.evict(int64(n))
 	c.reservedSize += int64(n)
-	c.evict()
 	c.mu.Unlock()
 }
 
 // Size returns the current space used by the cache.
 func (c *shard) Size() int64 {
 	c.mu.RLock()
-	size := c.sizeHot + c.sizeCold
+	size := c.sizeHot + c.sizeResCold
 	c.mu.RUnlock()
 	return size
 }
@@ -276,8 +440,8 @@ func (c *shard) targetSize() int64 {
 
 // Add the entry to the cache, returning true if the entry was added and false
 // if it would not fit in the cache.
-func (c *shard) metaAdd(key key, e *entry) bool {
-	c.evict()
+func (c *shard) metaAdd(key key, e *entry, ptype entryType) bool {
+	c.evict(e.size)
 	if e.size > c.targetSize() {
 		// The entry is larger than the target cache size.
 		return false
@@ -290,18 +454,7 @@ func (c *shard) metaAdd(key key, e *entry) bool {
 		c.entries[e] = struct{}{}
 	}
 
-	if c.handHot == nil {
-		// first element
-		c.handHot = e
-		c.handCold = e
-		c.handTest = e
-	} else {
-		c.handHot.link(e)
-	}
-
-	if c.handCold == c.handHot {
-		c.handCold = c.handCold.prev()
-	}
+	c.moveToHead(e, ptype)
 
 	fkey := key.file()
 	if fileBlocks := c.files.Get(fkey); fileBlocks == nil {
@@ -328,22 +481,7 @@ func (c *shard) metaDel(e *entry) {
 		delete(c.entries, e)
 	}
 
-	if e == c.handHot {
-		c.handHot = c.handHot.prev()
-	}
-	if e == c.handCold {
-		c.handCold = c.handCold.prev()
-	}
-	if e == c.handTest {
-		c.handTest = c.handTest.prev()
-	}
-
-	if e.unlink() == e {
-		// This was the last entry in the cache.
-		c.handHot = nil
-		c.handCold = nil
-		c.handTest = nil
-	}
+	c.removeFromClock(e)
 
 	fkey := e.key.file()
 	if next := e.unlinkFile(); e == next {
@@ -373,7 +511,7 @@ func (c *shard) metaCheck(e *entry) {
 		}
 		// NB: c.hand{Hot,Cold,Test} are pointers into a single linked list. We
 		// only have to traverse one of them to check all of them.
-		for t := c.handHot.next(); t != c.handHot; t = t.next() {
+		for t := c.listHead.next(); t != c.listHead; t = t.next() {
 			if e == t {
 				fmt.Fprintf(os.Stderr, "%p: %s unexpectedly found in blocks list\n%s",
 					e, e.key, debug.Stack())
@@ -384,94 +522,122 @@ func (c *shard) metaCheck(e *entry) {
 }
 
 func (c *shard) metaEvict(e *entry) {
-	switch e.ptype {
-	case etHot:
-		c.sizeHot -= e.size
-	case etCold:
-		c.sizeCold -= e.size
-	case etTest:
-		c.sizeTest -= e.size
-	}
+	// switch e.ptype {
+	// case etHot:
+	// 	c.sizeHot -= e.size
+	// case etColdResInTest:
+	// 	c.sizeResCold -= e.size
+	// case etColdRes:
+	// 	c.sizeResCold -= e.size
+	// case etColdNonRes:
+	// 	c.sizeNonResCold -= e.size
+	// }
 	c.metaDel(e)
 	c.metaCheck(e)
 	e.free()
 }
 
-func (c *shard) evict() {
-	for c.targetSize() <= c.sizeHot+c.sizeCold && c.handCold != nil {
-		c.runHandCold()
+func (c *shard) evict(n int64) {
+	if n > c.targetSize() {
+		n = c.targetSize()
+	}
+	for c.targetSize() < c.sizeHot+c.sizeResCold+n {
+		if c.sizeResCold > 0 {
+			c.runHandCold()
+		} else {
+			c.runHandHot(nil)
+		}
 	}
 }
 
 func (c *shard) runHandCold() {
-	e := c.handCold
-	if e.ptype == etCold {
-		if atomic.LoadInt32(&e.referenced) == 1 {
-			atomic.StoreInt32(&e.referenced, 0)
-			e.ptype = etHot
-			c.sizeCold -= e.size
-			c.sizeHot += e.size
-		} else {
-			e.setValue(nil)
-			e.ptype = etTest
-			c.sizeCold -= e.size
-			c.sizeTest += e.size
-			for c.targetSize() < c.sizeTest && c.handTest != nil {
-				c.runHandTest()
-			}
-		}
+	// runHandCold is used to search for a resident cold page for replacement.
+	for !c.handCold.ptype.isResidentCold() {
+		c.handCold = c.handCold.next()
 	}
 
-	c.handCold = c.handCold.next()
-
-	for c.targetSize()-c.coldTarget <= c.sizeHot && c.handHot != nil {
-		c.runHandHot()
+	if atomic.LoadInt32(&c.handCold.referenced) == 1 {
+		// If its bit is set and it is in its test period, we turn the cold page into a hot page,
+		// and ask HAND for its actions, because an access during the test period indicates a
+		// competitively small reuse distance. If its bit is set but it is not in its test period,
+		// there are no status change as well as HAND actions. Its reference bit is reset, and we
+		// move it to the list head.
+		if c.handCold.ptype.isInTest() {
+			if c.canPromote(c.handCold) {
+				c.moveToHead(c.handCold, etHot)
+			} else {
+				c.moveToHead(c.handCold, etColdResInTest)
+			}
+		} else {
+			c.moveToHead(c.handCold, etColdResInTest)
+		}
+	} else {
+		// If the reference bit of the cold page currently pointed to by handCold is unset, we replace
+		// the cold page for a free space. If the replaced cold page is in its test period, then it
+		// will remain in the list as a non-resident cold page until it runs out of its test period.
+		// If the replaced cold page is not in its test period, we move it out of the clock.
+		if c.handCold.ptype.isInTest() {
+			c.handCold.setValue(nil)
+			c.setEntryType(c.handCold, etColdNonRes)
+			c.handCold = c.handCold.next()
+		} else {
+			c.metaEvict(c.handCold)
+		}
+		// We keep track the number of non-resident cold pages. Once the number exceeds the limit, we
+		// terminate the test period of the cold page pointed to by handTest.
+		for c.sizeNonResCold > c.targetSize() {
+			c.runHandTest()
+		}
 	}
 }
 
-func (c *shard) runHandHot() {
-	if c.handHot == c.handTest && c.handTest != nil {
-		c.runHandTest()
-		if c.handHot == nil {
-			return
-		}
-	}
+// runHandHot demotes a hot node between the handHot and trigger node. If the demotion was
+// successful it returns true, otherwise it returns false.
+func (c *shard) runHandHot(trigger *entry) bool {
+	// What triggers the movement of handHot is that a cold page (== argument "trigger") is found to
+	// have been accessed in its test period and thus turns into a hot page, which "maybe"
+	// accordingly turns the hot page with the largest recency into a cold page.
+	c.nextHandHot()
 
-	e := c.handHot
-	if e.ptype == etHot {
-		if atomic.LoadInt32(&e.referenced) == 1 {
-			atomic.StoreInt32(&e.referenced, 0)
+	demoted := false
+	for c.handHot != trigger {
+		if c.handHot.ptype == etHot {
+			// If the reference bit of the hot page pointed to by handHot is unset, we can simply change
+			// its status and then move the hand forward. However, if the bit is set, which indicates
+			// the page has been re-accessed, we spare this page, reset its reference bit and keep it as
+			// a hot page. This is because the actual access time of the hot page could be earlier than
+			// the cold page. Then we move the hand forward and do the same on the hot pages with their
+			// bits set until the hand encounters a hot page with a reference bit of zero. Then the hot
+			// page turns into a cold page.
+			if atomic.LoadInt32(&c.handHot.referenced) == 1 {
+				c.moveToHead(c.handHot, etHot)
+			} else {
+				c.moveToHead(c.handHot, etColdRes)
+				demoted = true
+				break
+			}
 		} else {
-			e.ptype = etCold
-			c.sizeHot -= e.size
-			c.sizeCold += e.size
+			// Whenever the hand encounters a cold page, it will terminate the page’s test period. The
+			// hand will also remove the cold page from the clock if it is non-resident (the most
+			// probable case). It actually does the work on the cold page on behalf of handTest.
+			c.handHot = c.handHot.next()
+			c.terminateTestPeriod(c.handHot.prev())
 		}
 	}
-
-	c.handHot = c.handHot.next()
+	// Finally the hand stops at a next hot page.
+	c.nextHandHot()
+	return demoted
 }
 
 func (c *shard) runHandTest() {
-	if c.sizeCold > 0 && c.handTest == c.handCold && c.handCold != nil {
-		c.runHandCold()
+	if c.handTest == nil {
+		c.handTest = c.handHot
 		if c.handTest == nil {
-			return
+			c.handTest = c.listHead.next()
 		}
 	}
-
-	e := c.handTest
-	if e.ptype == etTest {
-		c.sizeTest -= e.size
-		c.coldTarget -= e.size
-		if c.coldTarget < 0 {
-			c.coldTarget = 0
-		}
-		c.metaDel(e)
-		c.metaCheck(e)
-		e.free()
-	}
-
 	c.handTest = c.handTest.next()
+	c.terminateTestPeriod(c.handTest.prev())
 }
 
 // Metrics holds metrics for the cache.
@@ -734,7 +900,7 @@ func (c *Cache) Metrics() Metrics {
 		s := &c.shards[i]
 		s.mu.RLock()
 		m.Count += int64(s.blocks.Count())
-		m.Size += s.sizeHot + s.sizeCold
+		m.Size += s.sizeHot + s.sizeResCold
 		s.mu.RUnlock()
 		m.Hits += atomic.LoadInt64(&s.hits)
 		m.Misses += atomic.LoadInt64(&s.misses)

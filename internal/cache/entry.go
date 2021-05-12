@@ -7,19 +7,33 @@ package cache
 type entryType int8
 
 const (
-	etTest entryType = iota
-	etCold
+	etColdNonRes entryType = iota
+	etColdRes
+	etColdResInTest
 	etHot
+	etOutOfClock
 )
+
+func (p entryType) isInTest() bool {
+	return p == etColdResInTest || p == etColdNonRes
+}
+
+func (p entryType) isResidentCold() bool {
+	return p == etColdResInTest || p == etColdRes
+}
 
 func (p entryType) String() string {
 	switch p {
-	case etTest:
-		return "test"
-	case etCold:
-		return "cold"
+	case etColdNonRes:
+		return "non-resident"
+	case etColdRes:
+		return "resident-cold"
+	case etColdResInTest:
+		return "resdient-cold-in-test"
 	case etHot:
 		return "hot"
+	case etOutOfClock:
+		return "out-of-clock"
 	}
 	return "unknown"
 }
@@ -68,7 +82,7 @@ func newEntry(s *shard, key key, size int64) *entry {
 	*e = entry{
 		key:   key,
 		size:  size,
-		ptype: etCold,
+		ptype: etOutOfClock,
 		shard: s,
 	}
 	e.blockLink.next = e
@@ -100,10 +114,10 @@ func (e *entry) prev() *entry {
 }
 
 func (e *entry) link(s *entry) {
-	s.blockLink.prev = e.blockLink.prev
-	s.blockLink.prev.blockLink.next = s
-	s.blockLink.next = e
+	s.blockLink.next = e.blockLink.next
 	s.blockLink.next.blockLink.prev = s
+	s.blockLink.prev = e
+	s.blockLink.prev.blockLink.next = s
 }
 
 func (e *entry) unlink() *entry {
