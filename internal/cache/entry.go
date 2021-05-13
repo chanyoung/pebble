@@ -7,15 +7,15 @@ package cache
 type entryType int8
 
 const (
-	etTest entryType = iota
+	etNR entryType = iota
 	etCold
 	etHot
 )
 
 func (p entryType) String() string {
 	switch p {
-	case etTest:
-		return "test"
+	case etNR:
+		return "non-resident"
 	case etCold:
 		return "cold"
 	case etHot:
@@ -60,7 +60,8 @@ type entry struct {
 	shard      *shard
 	// Reference count for the entry. The entry is freed when the reference count
 	// drops to zero.
-	ref refcnt
+	ref   refcnt
+	epoch int64
 }
 
 func newEntry(s *shard, key key, size int64) *entry {
@@ -100,10 +101,10 @@ func (e *entry) prev() *entry {
 }
 
 func (e *entry) link(s *entry) {
-	s.blockLink.prev = e.blockLink.prev
-	s.blockLink.prev.blockLink.next = s
-	s.blockLink.next = e
-	s.blockLink.next.blockLink.prev = s
+	e.blockLink.prev = s
+	e.blockLink.next = s.blockLink.next
+	e.blockLink.prev.blockLink.next = e
+	e.blockLink.next.blockLink.prev = e
 }
 
 func (e *entry) unlink() *entry {
